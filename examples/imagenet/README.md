@@ -11,17 +11,17 @@ Also, you will need to [download the Imagenet dataset per the original example](
 
 #### Package the inception code as a Python zip/module
 
-    pushd ~/tensorflow/examples/imagenet; zip -r ~/inception.zip inception; popd
+    export TFoS_HOME=<path to TensorFlowOnSpark>
+    pushd ${TFoS_HOME}/examples/imagenet; zip -r ~/inception.zip inception; popd
 
 #### Run distributed CNN on Spark
 
     # set environment variables (if not already done)
     export PYTHON_ROOT=~/Python
     export PYSPARK_PYTHON=${PYTHON_ROOT}/bin/python
-    export SPARK_YARN_USER_ENV="PYSPARK_PYTHON=Python/bin/python"
     export PATH=${PYTHON_ROOT}/bin/:$PATH
     export QUEUE=gpu
-    # export IMAGENET_DATA=<HDFS path to your downloaded files>
+    export IMAGENET_DATA=<HDFS path to your downloaded files>
 
     # for CPU mode:
     # export QUEUE=default
@@ -35,14 +35,14 @@ Also, you will need to [download the Imagenet dataset per the original example](
     --queue ${QUEUE} \
     --num-executors 4 \
     --executor-memory 27G \
-    --py-files tensorflow/tfspark.zip,inception.zip \
+    --py-files ${TFoS_HOME}/tfspark.zip,inception.zip \
     --conf spark.dynamicAllocation.enabled=false \
     --conf spark.yarn.maxAppAttempts=1 \
     --archives hdfs:///user/${USER}/Python.zip#Python \
     --conf spark.executorEnv.LD_LIBRARY_PATH="/usr/local/cuda-7.5/lib64:$JAVA_HOME/jre/lib/amd64/server" \
     --driver-library-path="/usr/local/cuda-7.5/lib64" \
-    tensorflow/examples/imagenet/inception/imagenet_distributed_train.py \
-    --data_dir $IMAGENET_DATA \
+    ${TFoS_HOME}/examples/imagenet/inception/imagenet_distributed_train.py \
+    --data_dir ${IMAGENET_DATA} \
     --train_dir hdfs://default/user/${USER}/imagenet_train \
     --max_steps 1000 \
     --subset train
@@ -64,14 +64,14 @@ To evaluate the model, run the following job after the training has completed.  
     --queue ${QUEUE} \
     --num-executors 1 \
     --executor-memory 27G \
-    --py-files tensorflow/tfspark.zip,inception.zip \
+    --py-files ${TFoS_HOME}/tfspark.zip,inception.zip \
     --conf spark.dynamicAllocation.enabled=false \
     --conf spark.yarn.maxAppAttempts=1 \
     --archives hdfs:///user/${USER}/Python.zip#Python \
     --conf spark.executorEnv.LD_LIBRARY_PATH="/usr/local/cuda-7.5/lib64:$JAVA_HOME/jre/lib/amd64/server" \
     --driver-library-path="/usr/local/cuda-7.5/lib64" \
-    tensorflow/examples/imagenet/inception/imagenet_eval.py \
-    --data_dir $IMAGENET_DATA \
+    ${TFoS_HOME}/examples/imagenet/inception/imagenet_eval.py \
+    --data_dir ${IMAGENET_DATA} \
     --checkpoint_dir hdfs://default/user/${USER}/imagenet_train \
     --eval_dir hdfs://default/user/${USER}/imagenet_eval \
     --subset validation \

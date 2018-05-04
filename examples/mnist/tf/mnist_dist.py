@@ -8,22 +8,19 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+
 def print_log(worker_num, arg):
-  print("%d: " %worker_num, end=" ")
+  print("%d: " % worker_num, end=" ")
   print(arg)
 
+
 def map_fun(args, ctx):
-  from com.yahoo.ml.tf import TFNode
   from datetime import datetime
-  import getpass
   import math
-  import numpy
   import os
-  import signal
   import tensorflow as tf
   import time
 
-  IMAGE_PIXELS=28
   worker_num = ctx.worker_num
   job_name = ctx.job_name
   task_index = ctx.task_index
@@ -35,11 +32,11 @@ def map_fun(args, ctx):
     time.sleep((worker_num + 1) * 5)
 
   # Parameters
+  IMAGE_PIXELS = 28
   hidden_units = 128
-  batch_size   = 100
 
   # Get TF cluster and server instances
-  cluster, server = TFNode.start_cluster_server(ctx, 1, args.rdma)
+  cluster, server = ctx.start_cluster_server(1, args.rdma)
 
   def read_csv_examples(image_dir, label_dir, batch_size=100, num_epochs=None, task_index=None, num_workers=None):
     print_log(worker_num, "num_epochs: {0}".format(num_epochs))
@@ -58,8 +55,8 @@ def map_fun(args, ctx):
     # Setup reader for image queue
     img_reader = tf.TextLineReader(name="img_reader")
     _, img_csv = img_reader.read(image_queue)
-    image_defaults = [ [1.0] for col in range(784) ]
-    img = tf.pack(tf.decode_csv(img_csv, image_defaults))
+    image_defaults = [[1.0] for col in range(784)]
+    img = tf.stack(tf.decode_csv(img_csv, image_defaults))
     # Normalize values to [0,1]
     norm = tf.constant(255, dtype=tf.float32, shape=(784,))
     image = tf.div(img, norm)
@@ -68,12 +65,12 @@ def map_fun(args, ctx):
     # Setup reader for label queue
     label_reader = tf.TextLineReader(name="label_reader")
     _, label_csv = label_reader.read(label_queue)
-    label_defaults = [ [1.0] for col in range(10) ]
-    label = tf.pack(tf.decode_csv(label_csv, label_defaults))
+    label_defaults = [[1.0] for col in range(10)]
+    label = tf.stack(tf.decode_csv(label_csv, label_defaults))
     print_log(worker_num, "label: {0}".format(label))
 
     # Return a batch of examples
-    return tf.train.batch([image,label], batch_size, num_threads=args.readers, name="batch_csv")
+    return tf.train.batch([image, label], batch_size, num_threads=args.readers, name="batch_csv")
 
   def read_tfr_examples(path, batch_size=100, num_epochs=None, task_index=None, num_workers=None):
     print_log(worker_num, "num_epochs: {0}".format(num_epochs))
@@ -95,7 +92,7 @@ def map_fun(args, ctx):
     # Setup reader for examples
     reader = tf.TFRecordReader(name="reader")
     _, serialized = reader.read(file_queue)
-    feature_def = {'label': tf.FixedLenFeature([10], tf.int64), 'image': tf.FixedLenFeature([784], tf.int64) }
+    feature_def = {'label': tf.FixedLenFeature([10], tf.int64), 'image': tf.FixedLenFeature([784], tf.int64)}
     features = tf.parse_single_example(serialized, feature_def)
     norm = tf.constant(255, dtype=tf.float32, shape=(784,))
     image = tf.div(tf.to_float(features['image']), norm)
@@ -104,25 +101,27 @@ def map_fun(args, ctx):
     print_log(worker_num, "label: {0}".format(label))
 
     # Return a batch of examples
-    return tf.train.batch([image,label], batch_size, num_threads=args.readers, name="batch")
+    return tf.train.batch([image, label], batch_size, num_threads=args.readers, name="batch")
 
   if job_name == "ps":
     server.join()
   elif job_name == "worker":
     # Assigns ops to the local worker by default.
     with tf.device(tf.train.replica_device_setter(
-        worker_device="/job:worker/task:%d" % task_index,
-        cluster=cluster)):
+      worker_device="/job:worker/task:%d" % task_index,
+      cluster=cluster)):
 
       # Variables of the hidden layer
       hid_w = tf.Variable(tf.truncated_normal([IMAGE_PIXELS * IMAGE_PIXELS, hidden_units],
-                              stddev=1.0 / IMAGE_PIXELS), name="hid_w")
+                          stddev=1.0 / IMAGE_PIXELS), name="hid_w")
       hid_b = tf.Variable(tf.zeros([hidden_units]), name="hid_b")
+      tf.summary.histogram("hidden_weights", hid_w)
 
       # Variables of the softmax layer
       sm_w = tf.Variable(tf.truncated_normal([hidden_units, 10],
-                              stddev=1.0 / math.sqrt(hidden_units)), name="sm_w")
+                         stddev=1.0 / math.sqrt(hidden_units)), name="sm_w")
       sm_b = tf.Variable(tf.zeros([10]), name="sm_b")
+      tf.summary.histogram("softmax_weights", sm_w)
 
       # Placeholders or QueueRunner/Readers for input data
       num_epochs = 1 if args.mode == "inference" else None if args.epochs == 0 else args.epochs
@@ -130,14 +129,17 @@ def map_fun(args, ctx):
       workers = num_workers if args.mode == "inference" else None
 
       if args.format == "csv":
-        images = TFNode.hdfs_path(ctx, args.images)
-        labels = TFNode.hdfs_path(ctx, args.labels)
+        images = ctx.absolute_path(args.images)
+        labels = ctx.absolute_path(args.labels)
         x, y_ = read_csv_examples(images, labels, 100, num_epochs, index, workers)
       elif args.format == "tfr":
-        images = TFNode.hdfs_path(ctx, args.images)
+        images = ctx.absolute_path(args.images)
         x, y_ = read_tfr_examples(images, 100, num_epochs, index, workers)
       else:
         raise("{0} format not supported for tf input mode".format(args.format))
+
+      x_img = tf.reshape(x, [-1, IMAGE_PIXELS, IMAGE_PIXELS, 1])
+      tf.summary.image("x_img", x_img)
 
       hid_lin = tf.nn.xw_plus_b(x, hid_w, hid_b)
       hid = tf.nn.relu(hid_lin)
@@ -147,42 +149,47 @@ def map_fun(args, ctx):
       global_step = tf.Variable(0)
 
       loss = -tf.reduce_sum(y_ * tf.log(tf.clip_by_value(y, 1e-10, 1.0)))
+      tf.summary.scalar("loss", loss)
       train_op = tf.train.AdagradOptimizer(0.01).minimize(
           loss, global_step=global_step)
 
       # Test trained model
       label = tf.argmax(y_, 1, name="label")
-      prediction = tf.argmax(y, 1,name="prediction")
+      prediction = tf.argmax(y, 1, name="prediction")
       correct_prediction = tf.equal(prediction, label)
       accuracy = tf.reduce_mean(tf.cast(correct_prediction, tf.float32), name="accuracy")
+      tf.summary.scalar("acc", accuracy)
 
       saver = tf.train.Saver()
       summary_op = tf.summary.merge_all()
       init_op = tf.global_variables_initializer()
 
     # Create a "supervisor", which oversees the training process and stores model state into HDFS
-    logdir = TFNode.hdfs_path(ctx, args.model)
+    logdir = ctx.absolute_path(args.model)
     print("tensorflow model path: {0}".format(logdir))
-    summary_writer = tf.summary.FileWriter("tensorboard_%d" %(worker_num), graph=tf.get_default_graph())
+
+    if job_name == "worker" and task_index == 0:
+      summary_writer = tf.summary.FileWriter(logdir, graph=tf.get_default_graph())
 
     if args.mode == "train":
       sv = tf.train.Supervisor(is_chief=(task_index == 0),
                                logdir=logdir,
                                init_op=init_op,
-                               summary_op=summary_op,
+                               summary_op=None,
+                               summary_writer=None,
                                saver=saver,
                                global_step=global_step,
-                               summary_writer=summary_writer,
                                stop_grace_secs=300,
                                save_model_secs=10)
     else:
       sv = tf.train.Supervisor(is_chief=(task_index == 0),
                                logdir=logdir,
+                               summary_op=None,
                                saver=saver,
                                global_step=global_step,
                                stop_grace_secs=300,
                                save_model_secs=0)
-      output_dir = TFNode.hdfs_path(ctx, args.output)
+      output_dir = ctx.absolute_path(args.output)
       output_file = tf.gfile.Open("{0}/part-{1:05d}".format(output_dir, worker_num), mode='w')
 
     # The supervisor takes care of session initialization, restoring from
@@ -203,10 +210,11 @@ def map_fun(args, ctx):
           if (step % 100 == 0):
             print("{0} step: {1} accuracy: {2}".format(datetime.now().isoformat(), step, sess.run(accuracy)))
           _, summary, step = sess.run([train_op, summary_op, global_step])
-          summary_writer.add_summary(summary, step)
-        else: # args.mode == "inference"
+          if sv.is_chief:
+            summary_writer.add_summary(summary, step)
+        else:  # args.mode == "inference"
           labels, pred, acc = sess.run([label, prediction, accuracy])
-          #print("label: {0}, pred: {1}".format(labels, pred))
+          # print("label: {0}, pred: {1}".format(labels, pred))
           print("acc: {0}".format(acc))
           for i in range(len(labels)):
             count += 1
@@ -215,8 +223,11 @@ def map_fun(args, ctx):
 
     if args.mode == "inference":
       output_file.close()
+      # Delay chief worker from shutting down supervisor during inference, since it can load model, start session,
+      # run inference and request stop before the other workers even start/sync their sessions.
+      if task_index == 0:
+        time.sleep(60)
 
     # Ask for all the services to stop.
     print("{0} stopping supervisor".format(datetime.now().isoformat()))
     sv.stop()
-

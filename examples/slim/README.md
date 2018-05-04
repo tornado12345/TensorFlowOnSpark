@@ -9,17 +9,17 @@ And, you will need to [download an image dataset](https://github.com/tensorflow/
 
 #### Package the code as a Python zip/module
 
-    pushd ~/tensorflow/examples/slim; zip -r ~/slim.zip .; popd
+    export TFoS_HOME=<Path to TensorFlowOnSpark>
+    pushd ${TFoS_HOME}/examples/slim; zip -r ~/slim.zip .; popd
 
 #### Train TF-Slim Classifier
 
     # set environment variables (if not already done)
     export PYTHON_ROOT=~/Python
     export PYSPARK_PYTHON=${PYTHON_ROOT}/bin/python
-    export SPARK_YARN_USER_ENV="PYSPARK_PYTHON=Python/bin/python"
     export PATH=${PYTHON_ROOT}/bin/:$PATH
     export QUEUE=gpu
-    # export DATASET_DIR=<HDFS path to your downloaded files>
+    export DATASET_DIR=<HDFS path to your downloaded files>
 
     # for CPU mode:
     # export QUEUE=default
@@ -33,15 +33,15 @@ And, you will need to [download an image dataset](https://github.com/tensorflow/
     --queue ${QUEUE} \
     --num-executors 3 \
     --executor-memory ${MEMORY}G \
-    --py-files tensorflow/tfspark.zip,slim.zip \
+    --py-files ${TFoS_HOME}/tfspark.zip,slim.zip \
     --conf spark.dynamicAllocation.enabled=false \
     --conf spark.yarn.maxAppAttempts=1 \
     --conf spark.ui.view.acls=* \
     --archives hdfs:///user/${USER}/Python.zip#Python \
     --conf spark.executorEnv.LD_LIBRARY_PATH="/usr/local/cuda-7.5/lib64:$JAVA_HOME/jre/lib/amd64/server" \
     --driver-library-path="/usr/local/cuda-7.5/lib64" \
-    tensorflow/examples/slim/train_image_classifier.py \
-    --dataset_dir $DATASET_DIR \
+    ${TFoS_HOME}/examples/slim/train_image_classifier.py \
+    --dataset_dir ${DATASET_DIR} \
     --train_dir hdfs://default/user/${USER}/slim_train \
     --dataset_name imagenet \
     --dataset_split_name train \
@@ -58,16 +58,15 @@ And, you will need to [download an image dataset](https://github.com/tensorflow/
     --queue ${QUEUE} \
     --num-executors 1 \
     --executor-memory 27G \
-    --py-files tensorflow/tfspark.zip,slim.zip \
+    --py-files ${TFoS_HOME}/tfspark.zip,slim.zip \
     --conf spark.dynamicAllocation.enabled=false \
     --conf spark.yarn.maxAppAttempts=1 \
     --conf spark.ui.view.acls=* \
-    --conf spark.task.maxFailures=1 \
     --archives hdfs:///user/${USER}/Python.zip#Python \
     --conf spark.executorEnv.LD_LIBRARY_PATH="/usr/local/cuda-7.5/lib64:$JAVA_HOME/jre/lib/amd64/server" \
     --driver-library-path="/usr/local/cuda-7.5/lib64" \
-    tensorflow/examples/slim/eval_image_classifier.py \
-    --dataset_dir $DATASET_DIR \
+    ${TFoS_HOME}/examples/slim/eval_image_classifier.py \
+    --dataset_dir ${DATASET_DIR} \
     --dataset_name imagenet \
     --dataset_split_name validation \
     --model_name inception_v3 \
