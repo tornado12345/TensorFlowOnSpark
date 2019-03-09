@@ -25,6 +25,7 @@ from __future__ import print_function
 import logging
 import os
 import random
+import signal
 import sys
 import threading
 import time
@@ -57,7 +58,7 @@ class TFCluster(object):
   queues = None                 #: *INTERNAL_USE*
   server = None                 #: reservation.Server for this cluster
 
-  def train(self, dataRDD, num_epochs=0, qname='input'):
+  def train(self, dataRDD, num_epochs=0, feed_timeout=600, qname='input'):
     """*For InputMode.SPARK only*.  Feeds Spark RDD partitions into the TensorFlow worker nodes
 
     It is the responsibility of the TensorFlow "main" function to interpret the rows of the RDD.
@@ -69,29 +70,28 @@ class TFCluster(object):
     Args:
       :dataRDD: input data as a Spark RDD.
       :num_epochs: number of times to repeat the dataset during training.
+      :feed_timeout: number of seconds after which data feeding times out (600 sec default)
       :qname: *INTERNAL USE*.
     """
     logging.info("Feeding training data")
-    assert(self.input_mode == InputMode.SPARK)
-    assert(qname in self.queues)
-    assert(num_epochs >= 0)
+    assert self.input_mode == InputMode.SPARK, "TFCluster.train() requires InputMode.SPARK"
+    assert qname in self.queues, "Unknown queue: {}".format(qname)
+    assert num_epochs >= 0, "num_epochs cannot be negative"
 
     if isinstance(dataRDD, DStream):
       # Spark Streaming
-      dataRDD.foreachRDD(lambda rdd: rdd.foreachPartition(TFSparkNode.train(self.cluster_info, self.cluster_meta, qname)))
+      dataRDD.foreachRDD(lambda rdd: rdd.foreachPartition(TFSparkNode.train(self.cluster_info, self.cluster_meta, feed_timeout=feed_timeout, qname=qname)))
     else:
       # Spark RDD
       # if num_epochs unspecified, pick an arbitrarily "large" number for now
       # TODO: calculate via dataRDD.count() / batch_size / max_steps
       if num_epochs == 0:
         num_epochs = 10
-      rdds = []
-      for i in range(num_epochs):
-        rdds.append(dataRDD)
+      rdds = [dataRDD] * num_epochs
       unionRDD = self.sc.union(rdds)
-      unionRDD.foreachPartition(TFSparkNode.train(self.cluster_info, self.cluster_meta, qname))
+      unionRDD.foreachPartition(TFSparkNode.train(self.cluster_info, self.cluster_meta, feed_timeout=feed_timeout, qname=qname))
 
-  def inference(self, dataRDD, qname='input'):
+  def inference(self, dataRDD, feed_timeout=600, qname='input'):
     """*For InputMode.SPARK only*: Feeds Spark RDD partitions into the TensorFlow worker nodes and returns an RDD of results
 
     It is the responsibility of the TensorFlow "main" function to interpret the rows of the RDD and provide valid data for the output RDD.
@@ -101,68 +101,78 @@ class TFCluster(object):
 
     Args:
       :dataRDD: input data as a Spark RDD
+      :feed_timeout: number of seconds after which data feeding times out (600 sec default)
       :qname: *INTERNAL_USE*
 
     Returns:
       A Spark RDD representing the output of the TensorFlow inferencing
     """
     logging.info("Feeding inference data")
-    assert(self.input_mode == InputMode.SPARK)
-    assert(qname in self.queues)
-    return dataRDD.mapPartitions(TFSparkNode.inference(self.cluster_info, qname))
+    assert self.input_mode == InputMode.SPARK, "TFCluster.inference() requires InputMode.SPARK"
+    assert qname in self.queues, "Unknown queue: {}".format(qname)
+    return dataRDD.mapPartitions(TFSparkNode.inference(self.cluster_info, feed_timeout=feed_timeout, qname=qname))
 
-  def shutdown(self, ssc=None):
+  def shutdown(self, ssc=None, grace_secs=0, timeout=259200):
     """Stops the distributed TensorFlow cluster.
+
+    For InputMode.SPARK, this will be executed AFTER the `TFCluster.train()` or `TFCluster.inference()` method completes.
+    For InputMode.TENSORFLOW, this will be executed IMMEDIATELY after `TFCluster.run()` and will wait until the TF worker nodes complete.
 
     Args:
       :ssc: *For Streaming applications only*. Spark StreamingContext
+      :grace_secs: Grace period to wait after all executors have completed their tasks before terminating the Spark application, e.g. to allow the chief worker to perform any final/cleanup duties like exporting or evaluating the model.  Default is 0.
+      :timeout: Time in seconds to wait for TF cluster to complete before terminating the Spark application.  This can be useful if the TF code hangs for any reason.  Default is 3 days.  Use -1 to disable timeout.
     """
     logging.info("Stopping TensorFlow nodes")
 
     # identify ps/workers
-    ps_list, worker_list = [], []
+    ps_list, worker_list, eval_list = [], [], []
     for node in self.cluster_info:
-      if node['job_name'] == 'ps':
-        ps_list.append(node)
-      else:
-        worker_list.append(node)
+      (ps_list if node['job_name'] == 'ps' else eval_list if node['job_name'] == 'evaluator' else worker_list).append(node)
 
+    # setup execution timeout
+    if timeout > 0:
+      def timeout_handler(signum, frame):
+        logging.error("TensorFlow execution timed out, exiting Spark application with error status")
+        self.sc.cancelAllJobs()
+        self.sc.stop()
+        sys.exit(1)
+
+      signal.signal(signal.SIGALRM, timeout_handler)
+      signal.alarm(timeout)
+
+    # wait for Spark Streaming termination or TF app completion for InputMode.TENSORFLOW
     if ssc is not None:
       # Spark Streaming
-      done = False
-      while not done:
-        done = ssc.awaitTerminationOrTimeout(1)
-        if not done and self.server.done:
+      while not ssc.awaitTerminationOrTimeout(1):
+        if self.server.done:
           logging.info("Server done, stopping StreamingContext")
           ssc.stop(stopSparkContext=False, stopGraceFully=True)
-        done = done or self.server.done
-    else:
+          break
+    elif self.input_mode == InputMode.TENSORFLOW:
       # in TENSORFLOW mode, there is no "data feeding" job, only a "start" job, so we must wait for the TensorFlow workers
       # to complete all tasks, while accounting for any PS tasks which run indefinitely.
-      if self.input_mode == InputMode.TENSORFLOW:
-        count = 0
-        done = False
-        while not done:
-          st = self.sc.statusTracker()
-          jobs = st.getActiveJobsIds()
-          if len(jobs) > 0:
-            stages = st.getActiveStageIds()
-            for i in stages:
-              si = st.getStageInfo(i)
-              if si.numActiveTasks == len(ps_list):
-                # if we only have PS tasks left, check that we see this condition a couple times
-                count += 1
-                done = (count >= 3)
-                time.sleep(5)
-          else:
-            done = True
+      count = 0
+      while count < 3:
+        st = self.sc.statusTracker()
+        jobs = st.getActiveJobsIds()
+        if len(jobs) == 0:
+          break
+        stages = st.getActiveStageIds()
+        for i in stages:
+          si = st.getStageInfo(i)
+          if si.numActiveTasks == len(ps_list) + len(eval_list):
+            # if we only have PS tasks left, check that we see this condition a couple times
+            count += 1
+        time.sleep(5)
 
-      # shutdown queues and managers for "worker" executors.
-      # note: in SPARK mode, this job will immediately queue up behind the "data feeding" job.
-      # in TENSORFLOW mode, this will only run after all workers have finished.
-      workers = len(worker_list)
-      workerRDD = self.sc.parallelize(range(workers), workers)
-      workerRDD.foreachPartition(TFSparkNode.shutdown(self.cluster_info, self.queues))
+    # shutdown queues and managers for "worker" executors.
+    # note: in SPARK mode, this job will immediately queue up behind the "data feeding" job.
+    # in TENSORFLOW mode, this will only run after all workers have finished.
+    workers = len(worker_list)
+    workerRDD = self.sc.parallelize(range(workers), workers)
+    workerRDD.foreachPartition(TFSparkNode.shutdown(self.cluster_info, self.queues))
+    time.sleep(grace_secs)
 
     # exit Spark application w/ err status if TF job had any errors
     if 'error' in tf_status:
@@ -174,7 +184,7 @@ class TFCluster(object):
     logging.info("Shutting down cluster")
     # shutdown queues and managers for "PS" executors.
     # note: we have to connect/shutdown from the spark driver, because these executors are "busy" and won't accept any other tasks.
-    for node in ps_list:
+    for node in ps_list + eval_list:
       addr = node['addr']
       authkey = node['authkey']
       m = TFManager.connect(addr, authkey)
@@ -183,8 +193,7 @@ class TFCluster(object):
       q.join()
 
     # wait for all jobs to finish
-    done = False
-    while not done:
+    while True:
       time.sleep(5)
       st = self.sc.statusTracker()
       jobs = st.getActiveJobsIds()
@@ -193,15 +202,15 @@ class TFCluster(object):
 
   def tensorboard_url(self):
     """Utility function to get the Tensorboard URL"""
-    tb_url = None
     for node in self.cluster_info:
       if node['tb_port'] != 0:
-        tb_url = "http://{0}:{1}".format(node['host'], node['tb_port'])
-    return tb_url
+        return "http://{0}:{1}".format(node['host'], node['tb_port'])
+    return None
 
 
 def run(sc, map_fun, tf_args, num_executors, num_ps, tensorboard=False, input_mode=InputMode.TENSORFLOW,
-        log_dir=None, driver_ps_nodes=False, master_node=None, reservation_timeout=600, queues=['input', 'output', 'error']):
+        log_dir=None, driver_ps_nodes=False, master_node=None, reservation_timeout=600, queues=['input', 'output', 'error'],
+        eval_node=False):
   """Starts the TensorFlowOnSpark cluster and Runs the TensorFlow "main" function on the Spark executors
 
   Args:
@@ -217,25 +226,44 @@ def run(sc, map_fun, tf_args, num_executors, num_ps, tensorboard=False, input_mo
     :master_node: name of the "master" or "chief" node in the cluster_template, used for `tf.estimator` applications.
     :reservation_timeout: number of seconds after which cluster reservation times out (600 sec default)
     :queues: *INTERNAL_USE*
+    :eval_node: run evaluator node for distributed Tensorflow
 
   Returns:
     A TFCluster object representing the started cluster.
   """
   logging.info("Reserving TFSparkNodes {0}".format("w/ TensorBoard" if tensorboard else ""))
-  assert num_ps < num_executors
 
   if driver_ps_nodes and input_mode != InputMode.TENSORFLOW:
     raise Exception('running PS nodes on driver locally is only supported in InputMode.TENSORFLOW')
 
-  # build a cluster_spec template using worker_nums
+  if eval_node and input_mode != InputMode.TENSORFLOW:
+    raise Exception('running evaluator nodes is only supported in InputMode.TENSORFLOW')
+
+  # compute size of TF cluster and validate against number of Spark executors
+  num_master = 1 if master_node else 0
+  num_eval = 1 if eval_node else 0
+  num_workers = max(num_executors - num_ps - num_eval - num_master, 0)
+  total_nodes = num_ps + num_master + num_eval + num_workers
+
+  assert total_nodes == num_executors, "TensorFlow cluster requires {} nodes, but only {} executors available".format(total_nodes, num_executors)
+  assert num_master + num_workers > 0, "TensorFlow cluster requires at least one worker or master/chief node"
+
+  # create a cluster template for scheduling TF nodes onto executors
+  executors = list(range(num_executors))
   cluster_template = {}
-  cluster_template['ps'] = range(num_ps)
-  if master_node is None:
-    cluster_template['worker'] = range(num_ps, num_executors)
-  else:
-    cluster_template[master_node] = range(num_ps, num_ps + 1)
-    if num_executors > num_ps + 1:
-      cluster_template['worker'] = range(num_ps + 1, num_executors)
+
+  if num_ps > 0:
+    cluster_template['ps'] = executors[:num_ps]
+    del executors[:num_ps]
+  if master_node:
+    cluster_template[master_node] = executors[:1]
+    del executors[:1]
+  if eval_node:
+    cluster_template['evaluator'] = executors[:1]
+    del executors[:1]
+  if num_workers > 0:
+    cluster_template['worker'] = executors[:num_workers]
+
   logging.info("cluster_template: {}".format(cluster_template))
 
   # get default filesystem from spark
@@ -326,11 +354,14 @@ def run(sc, map_fun, tf_args, num_executors, num_ps, tensorboard=False, input_mo
   for node in cluster_info:
     node_id = (node['host'], node['executor_id'])
     if node_id in tb_nodes:
-      raise Exception("Duplicate cluster node id detected (host={0}, executor_id={1})".format(node_id[0], node_id[1]) +
-                      "Please ensure that:\n" +
-                      "1. Number of executors >= number of TensorFlow nodes\n" +
-                      "2. Number of tasks per executors is 1\n" +
-                      "3, TFCluster.shutdown() is successfully invoked when done.")
+      msg = '''
+Duplicate cluster node id detected (host={0}, executor_id={1})
+Please ensure that:
+1. Number of executors >= number of TensorFlow nodes
+2. Number of tasks per executors is 1
+3, TFCluster.shutdown() is successfully invoked when done.
+'''.strip()
+      raise Exception(msg.format(node_id[0], node_id[1]))
     else:
       tb_nodes.add(node_id)
 

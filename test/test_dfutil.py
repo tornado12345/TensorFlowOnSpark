@@ -5,6 +5,7 @@ import unittest
 
 from tensorflowonspark import dfutil
 
+
 class DFUtilTest(test.SparkTest):
   @classmethod
   def setUpClass(cls):
@@ -18,6 +19,7 @@ class DFUtilTest(test.SparkTest):
     super(DFUtilTest, cls).tearDownClass()
 
   def setUp(self):
+    super(DFUtilTest, self).setUp()
     # remove any prior test artifacts
     shutil.rmtree(self.tfrecord_dir, ignore_errors=True)
 
@@ -30,7 +32,7 @@ class DFUtilTest(test.SparkTest):
     row1 = ('text string', 1, [2, 3, 4, 5], -1.1, [-2.2, -3.3, -4.4, -5.5], bytearray(b'\xff\xfe\xfd\xfc'))
     rdd = self.sc.parallelize([row1])
     df1 = self.spark.createDataFrame(rdd, ['a', 'b', 'c', 'd', 'e', 'f'])
-    print ("schema: {}".format(df1.schema))
+    print("schema: {}".format(df1.schema))
 
     # save the DataFrame as TFRecords
     dfutil.saveAsTFRecords(df1, self.tfrecord_dir)

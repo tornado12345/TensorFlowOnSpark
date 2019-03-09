@@ -117,7 +117,7 @@ def cnn_model_fn(features, labels, mode):
 
 def main(args, ctx):
   # Load training and eval data
-  mnist = tf.contrib.learn.datasets.load_dataset("mnist")
+  mnist = tf.contrib.learn.datasets.mnist.read_data_sets(args.data_dir)
   train_data = mnist.train.images  # Returns np.array
   train_labels = np.asarray(mnist.train.labels, dtype=np.int32)
   eval_data = mnist.test.images  # Returns np.array
@@ -175,12 +175,14 @@ if __name__ == "__main__":
   parser = argparse.ArgumentParser()
   parser.add_argument("--batch_size", help="number of records per batch", type=int, default=100)
   parser.add_argument("--cluster_size", help="number of nodes in the cluster", type=int, default=num_executors)
-  parser.add_argument("--model", help="HDFS path to save/load model during train/inference", default="mnist_model")
-  parser.add_argument("--output", help="HDFS path to save test/inference output", default="predictions")
+  parser.add_argument("--data_dir", help="path to MNIST data", default="MNIST-data")
+  parser.add_argument("--model", help="path to save model/checkpoint", default="mnist_model")
   parser.add_argument("--num_ps", help="number of PS nodes in cluster", type=int, default=1)
   parser.add_argument("--steps", help="maximum number of steps", type=int, default=1000)
+  parser.add_argument("--tensorboard", help="launch tensorboard process", action="store_true")
+
   args = parser.parse_args()
   print("args:", args)
 
-  cluster = TFCluster.run(sc, main, args, args.cluster_size, args.num_ps, tensorboard=False, input_mode=TFCluster.InputMode.TENSORFLOW, log_dir=args.model, master_node='master')
+  cluster = TFCluster.run(sc, main, args, args.cluster_size, args.num_ps, tensorboard=args.tensorboard, input_mode=TFCluster.InputMode.TENSORFLOW, log_dir=args.model, master_node='master')
   cluster.shutdown()

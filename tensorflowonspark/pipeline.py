@@ -23,9 +23,9 @@ from pyspark.ml.pipeline import Estimator, Model
 from pyspark.sql import Row, SparkSession
 
 import tensorflow as tf
-from tensorflow.contrib.saved_model.python.saved_model import reader, signature_def_utils
+from tensorflow.contrib.saved_model.python.saved_model import reader
 from tensorflow.python.saved_model import loader
-from . import TFCluster, gpu_info, dfutil
+from . import TFCluster, gpu_info, dfutil, util
 
 import argparse
 import copy
@@ -391,7 +391,7 @@ class TFEstimator(Estimator, TFParams, HasInputMapping,
         assert local_args.tfrecord_dir, "Please specify --tfrecord_dir to export DataFrame to TFRecord."
         if self.getInputMapping():
           # if input mapping provided, filter only required columns before exporting
-          dataset = dataset.select(self.getInputMapping().keys())
+          dataset = dataset.select(list(self.getInputMapping()))
         logging.info("Exporting DataFrame {} as TFRecord to: {}".format(dataset.dtypes, local_args.tfrecord_dir))
         dfutil.saveAsTFRecords(dataset, local_args.tfrecord_dir)
         logging.info("Done saving")
@@ -401,9 +401,9 @@ class TFEstimator(Estimator, TFParams, HasInputMapping,
                             local_args.tensorboard, local_args.input_mode, driver_ps_nodes=local_args.driver_ps_nodes)
     if local_args.input_mode == TFCluster.InputMode.SPARK:
       # feed data, using a deterministic order for input columns (lexicographic by key)
-      input_cols = sorted(self.getInputMapping().keys())
+      input_cols = sorted(self.getInputMapping())
       cluster.train(dataset.select(input_cols).rdd, local_args.epochs)
-    cluster.shutdown()
+    cluster.shutdown(grace_secs=30)
 
     # Run export function, if provided
     if self.export_fn:
@@ -503,7 +503,7 @@ def _run_model(iterator, args, tf_args):
     assert args.export_dir, "Inferencing with signature_def_key requires --export_dir argument"
     logging.info("===== loading meta_graph_def for tag_set ({0}) from saved_model: {1}".format(args.tag_set, args.export_dir))
     meta_graph_def = get_meta_graph_def(args.export_dir, args.tag_set)
-    signature = signature_def_utils.get_signature_def_by_key(meta_graph_def, args.signature_def_key)
+    signature = meta_graph_def.signature_def[args.signature_def_key]
     logging.debug("signature: {}".format(signature))
     inputs_tensor_info = signature.inputs
     logging.debug("inputs_tensor_info: {0}".format(inputs_tensor_info))
@@ -570,32 +570,15 @@ def single_node_env(args):
   Args:
     :args: command line arguments as either argparse args or argv list
   """
+  # setup ARGV for the TF process
   if isinstance(args, list):
       sys.argv = args
   elif args.argv:
       sys.argv = args.argv
 
-  # ensure expanded CLASSPATH w/o glob characters (required for Spark 2.1 + JNI)
-  if 'HADOOP_PREFIX' in os.environ and 'TFOS_CLASSPATH_UPDATED' not in os.environ:
-      classpath = os.environ['CLASSPATH']
-      hadoop_path = os.path.join(os.environ['HADOOP_PREFIX'], 'bin', 'hadoop')
-      hadoop_classpath = subprocess.check_output([hadoop_path, 'classpath', '--glob']).decode()
-      logging.debug("CLASSPATH: {0}".format(hadoop_classpath))
-      os.environ['CLASSPATH'] = classpath + os.pathsep + hadoop_classpath
-      os.environ['TFOS_CLASSPATH_UPDATED'] = '1'
-
-  # reserve GPU, if requested
-  if tf.test.is_built_with_cuda():
-    # GPU
-    num_gpus = args.num_gpus if 'num_gpus' in args else 1
-    gpus_to_use = gpu_info.get_gpus(num_gpus)
-    logging.info("Using gpu(s): {0}".format(gpus_to_use))
-    os.environ['CUDA_VISIBLE_DEVICES'] = gpus_to_use
-    # Note: if there is a GPU conflict (CUDA_ERROR_INVALID_DEVICE), the entire task will fail and retry.
-  else:
-    # CPU
-    logging.info("Using CPU")
-    os.environ['CUDA_VISIBLE_DEVICES'] = ''
+  # setup ENV for Hadoop-compatibility and/or GPU allocation
+  num_gpus = args.num_gpus if 'num_gpus' in args else 1
+  util.single_node_env(num_gpus)
 
 
 def get_meta_graph_def(saved_model_dir, tag_set):

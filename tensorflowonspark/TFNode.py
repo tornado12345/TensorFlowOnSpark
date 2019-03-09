@@ -32,14 +32,25 @@ def hdfs_path(ctx, path):
   Returns:
     An absolute path prefixed with the correct filesystem scheme.
   """
-  if path.startswith("hdfs://") or path.startswith("viewfs://") or path.startswith("file://"):
+  #  All Hadoop-Compatible File System Schemes (as of Hadoop 3.0.x):
+  HADOOP_SCHEMES = ['adl://',
+                    'file://',
+                    'hdfs://',
+                    'oss://',
+                    's3://',
+                    's3a://',
+                    's3n://',
+                    'swift://',
+                    'viewfs://',
+                    'wasb://']
+  if (any(path.startswith(scheme) for scheme in HADOOP_SCHEMES)):
     # absolute path w/ scheme, just return as-is
     return path
   elif path.startswith("/"):
     # absolute path w/o scheme, just prepend w/ defaultFS
     return ctx.defaultFS + path
   else:
-    # relative path, prepend defaultSF + standard working dir
+    # relative path, prepend defaultFS + standard working dir
     if ctx.defaultFS.startswith("hdfs://") or ctx.defaultFS.startswith("viewfs://"):
       return "{0}/user/{1}/{2}".format(ctx.defaultFS, getpass.getuser(), path)
     elif ctx.defaultFS.startswith("file://"):
@@ -71,6 +82,13 @@ def start_cluster_server(ctx, num_gpus=1, rdma=False):
   logging.info("{0}: Cluster spec: {1}".format(ctx.worker_num, cluster_spec))
 
   if tf.test.is_built_with_cuda() and num_gpus > 0:
+    # compute my index relative to other nodes placed on the same host (for GPU allocation)
+    my_addr = cluster_spec[ctx.job_name][ctx.task_index]
+    my_host = my_addr.split(':')[0]
+    flattened = [v for sublist in cluster_spec.values() for v in sublist]
+    local_peers = [p for p in flattened if p.startswith(my_host)]
+    my_index = local_peers.index(my_addr)
+
     # GPU
     gpu_initialized = False
     retries = 3
@@ -81,7 +99,7 @@ def start_cluster_server(ctx, num_gpus=1, rdma=False):
           num_gpus = 1
 
         # Find a free gpu(s) to use
-        gpus_to_use = gpu_info.get_gpus(num_gpus)
+        gpus_to_use = gpu_info.get_gpus(num_gpus, my_index)
         gpu_prompt = "GPU" if num_gpus == 1 else "GPUs"
         logging.info("{0}: Using {1}: {2}".format(ctx.worker_num, gpu_prompt, gpus_to_use))
 
